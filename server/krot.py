@@ -175,6 +175,9 @@ class KrotServer(asyncio.DatagramProtocol):
         self.tasks = set()
         self.transport = None
         self.janitor = None
+        # Queries for our zone dropped for EDNS0: absent or UDP size below 1232.
+        self.edns_drops = 0
+        self.edns_min = None
 
     def connection_made(self, transport):
         self.transport = transport
@@ -198,6 +201,11 @@ class KrotServer(asyncio.DatagramProtocol):
     async def reap(self):
         while True:
             await asyncio.sleep(15)
+            if self.edns_drops:
+                logging.info('Dropped %d queries for EDNS0 in 15s (smallest UDP size %s, need 1232)',
+                             self.edns_drops, 'none' if self.edns_min is None else self.edns_min)
+                self.edns_drops = 0
+                self.edns_min = None
             now = time.monotonic()
             for sid, session in list(self.sessions.items()):
                 if now - session.touched > self.idle_timeout:
@@ -241,12 +249,15 @@ class KrotServer(asyncio.DatagramProtocol):
                 return
             if request.q.qtype not in (QTYPE.TXT, QTYPE.NULL, QTYPE.A) or request.q.qclass != 1:
                 return
-            opt = [r for r in request.ar if r.rtype == QTYPE.OPT]
-            if not opt or opt[0].rclass < 1232:
-                return
             labels = str(request.q.qname).rstrip('.').lower().split('.')
             suffix = self.domain.split('.')
             if labels[-len(suffix):] != suffix:
+                return
+            opt = [r for r in request.ar if r.rtype == QTYPE.OPT]
+            if not opt or opt[0].rclass < 1232:
+                self.edns_drops += 1
+                if opt and (self.edns_min is None or opt[0].rclass < self.edns_min):
+                    self.edns_min = opt[0].rclass
                 return
             labels = labels[:-len(suffix)]
             if len(labels) < 2 or any(not x or len(x) > 63 for x in labels):
@@ -410,7 +421,7 @@ async def main(args):
     transport, _ = await loop.create_datagram_endpoint(
         lambda: KrotServer(domain, password, args.max_response, args.allow_private),
         local_addr=(args.bind, args.port))
-    logging.info('Krot listening on %s:%d, zone %s', args.bind, args.port, domain)
+    logging.info('Krot listening on %s:%d, zone %s, max response %d', args.bind, args.port, domain, args.max_response)
     try:
         await asyncio.Future()
     finally:

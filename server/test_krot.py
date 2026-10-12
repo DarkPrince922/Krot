@@ -175,10 +175,15 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         query.ar.clear() # EDNS is mandatory
         client.transport.sendto(query.pack(), self.endpoint)
         query, _ = client.encode(frame(PING))
+        query.ar.clear(); query.add_ar(EDNS0(udp_len=512))
+        client.transport.sendto(query.pack(), self.endpoint)
+        query, _ = client.encode(frame(PING))
         wire = bytearray(query.pack()); wire[14] ^= 1 # corrupt ciphertext label
         client.transport.sendto(wire, self.endpoint)
         await asyncio.sleep(.1)
         self.assertEqual(client.received, before)
+        # Only our zone is counted, so the periodic log shows the resolver chain's EDNS.
+        self.assertEqual((self.server.edns_drops, self.server.edns_min), (2, 512))
         self.assertEqual((await client.rpc(frame(PING)))[0], PONG)
 
     async def test_tcp_drain_failure_never_duplicates_write(self):

@@ -83,7 +83,7 @@ class RetryIntegrationTest {
         }
     }
 
-    private fun transfer(drops: Int, delayMs: Long, minimumAttempts: Int) {
+    private fun transfer(drops: Int, delayMs: Long, minimumAttempts: Int, stalls: Boolean = false) {
         val udpPort = DatagramSocket(0).use { it.localPort }
         val socksPort = ServerSocket(0).use { it.localPort }
         val echo = ServerSocket(0)
@@ -101,7 +101,8 @@ class RetryIntegrationTest {
         val process = ProcessBuilder("python3", server.path, "--domain", domain, "--port", "$udpPort", "--bind", "127.0.0.1", "--allow-private")
             .apply { environment()["KROT_PASSWORD"] = password; redirectErrorStream(true); redirectOutput(File.createTempFile("krot-retry", ".log")) }.start()
         val proxy = LossProxy(InetSocketAddress("127.0.0.1", udpPort), drops, delayMs)
-        val tunnel = Tunnel(Config(domain, password, pipeline = 12, socksPort = socksPort), InetSocketAddress("127.0.0.1", proxy.socket.localPort))
+        val logs = CopyOnWriteArrayList<String>()
+        val tunnel = Tunnel(Config(domain, password, pipeline = 12, socksPort = socksPort), InetSocketAddress("127.0.0.1", proxy.socket.localPort), log = { logs.add(it) })
         try {
             tunnel.start(); tunnel.rtt = 20.0
             Socket("127.0.0.1", socksPort).use { s ->
@@ -117,6 +118,8 @@ class RetryIntegrationTest {
                 sent.get(30, TimeUnit.SECONDS)
                 assertTrue("Not enough retransmissions", proxy.hits.get() >= minimumAttempts)
                 assertEquals("Retries reused a cached QNAME", proxy.names.size, proxy.names.toSet().size)
+                assertEquals("Stall path: $logs", stalls, logs.any { "поток сохранён" in it })
+                assertTrue("Negotiated chunk is logged: $logs", logs.any { it.startsWith("Chunk ") })
             }
             echoJob.get(30, TimeUnit.SECONDS)
         } finally {
@@ -125,4 +128,6 @@ class RetryIntegrationTest {
     }
     @Test fun twoLossesAndSlowRepliesDoNotCloseStream() = transfer(drops = 2, delayMs = 800, minimumAttempts = 4)
     @Test fun seventhAttemptStillDeliversExactlyOnce() = transfer(drops = 6, delayMs = 0, minimumAttempts = 7)
+    // All seven attempts are lost while heartbeats still succeed: the block is retried, the stream stays open.
+    @Test fun exhaustedAttemptsKeepStreamWhileTunnelAnswers() = transfer(drops = 9, delayMs = 0, minimumAttempts = 10, stalls = true)
 }

@@ -31,6 +31,8 @@ class Tunnel(
     private val lastTraffic = AtomicLong(System.nanoTime())
     @Volatile var rtt = 500.0
     @Volatile private var lastSuccess = System.nanoTime()
+    private val lastStallLog = AtomicLong(0)
+    @Volatile private var loggedChunk = 0
 
     private fun thread(name: String, block: () -> Unit): Thread = Thread(block, name).also { it.isDaemon = true; it.start() }
     fun start(helloAttempts: Int = RpcRetryPolicy.ATTEMPTS) {
@@ -120,6 +122,24 @@ class Tunnel(
         } finally { inFlight.decrementAndGet(); semaphore.release() }
     }
 
+    /**
+     * A block whose seven attempts all timed out keeps its TCP stream while the tunnel
+     * itself still answers (heartbeat or other lanes succeeded meanwhile), up to
+     * [STREAM_STALL_MS]. Retrying DATA/POLL/FIN with the same seq is idempotent on the server.
+     */
+    private fun streamRpc(frame: Frame, transfer: Transfer): Frame {
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(STREAM_STALL_MS)
+        while (true) {
+            val started = System.nanoTime()
+            try { return rpc(frame) } catch (e: ServerRejected) { throw e } catch (e: IOException) {
+                if (!alive.get() || transfer.done.get() || lastSuccess - started <= 0 || System.nanoTime() - deadline > 0) throw e
+                val now = System.nanoTime(); val logged = lastStallLog.get()
+                if ((logged == 0L || now - logged > TimeUnit.SECONDS.toNanos(5)) && lastStallLog.compareAndSet(logged, now))
+                    log("Поток ${frame.stream}: DNS-таймаут, туннель жив — поток сохранён, повторяю")
+            }
+        }
+    }
+
     private fun serve(socket: Socket) {
         var stream = 0
         var state: Transfer? = null
@@ -159,6 +179,7 @@ class Tunnel(
             require(opened.data.size == 2)
             val chunk = ByteBuffer.wrap(opened.data).short.toInt() and 65535
             require(chunk in 100..cfg.maxResponse)
+            if (chunk != loggedChunk) { loggedChunk = chunk; log("Chunk $chunk Б (запрошено ${cfg.maxResponse})") }
             val transfer = Transfer(stream, socket, output, chunk); state = transfer
             active.incrementAndGet()
             socksReply(output, 0); socket.soTimeout = 0
@@ -171,7 +192,7 @@ class Tunnel(
                 if (n == 0) continue
                 val part = buffer.copyOf(n); val index = seq++
                 jobs.add(uploads.submit {
-                    rpc(Frame(Wire.DATA, transfer.stream, index, transfer.downAck.get(), part))
+                    streamRpc(Frame(Wire.DATA, transfer.stream, index, transfer.downAck.get(), part), transfer)
                     tx.addAndGet(part.size.toLong()); lastTraffic.set(System.nanoTime())
                 })
                 // Bound retained uploads and the distance ahead of a missing block.
@@ -179,7 +200,7 @@ class Tunnel(
             }
             while (jobs.isNotEmpty()) jobs.removeFirst().get()
             if (!transfer.done.get() && alive.get()) {
-                rpc(Frame(Wire.FIN, stream, seq, transfer.downAck.get()))
+                streamRpc(Frame(Wire.FIN, stream, seq, transfer.downAck.get()), transfer)
                 synchronized(transfer.monitor) {
                     while (!transfer.done.get() && alive.get()) transfer.monitor.wait(1000)
                 }
@@ -218,7 +239,7 @@ class Tunnel(
             var requested = nextPoll.getAndIncrement()
             try {
                 while (alive.get() && !done.get()) {
-                    val response = rpc(Frame(Wire.POLL, stream, requested, downAck.get()))
+                    val response = streamRpc(Frame(Wire.POLL, stream, requested, downAck.get()), this)
                     synchronized(monitor) {
                         if (done.get()) return
                         when (response.type) {
@@ -244,6 +265,8 @@ class Tunnel(
             }
         }
     }
+
+    companion object { const val STREAM_STALL_MS = 60_000L }
 
     override fun close() {
         if (!alive.compareAndSet(true, false)) return
