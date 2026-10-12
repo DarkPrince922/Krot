@@ -228,6 +228,9 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         poll = lambda: self.server.dispatch(session, None, POLL, 1, 0, 0, b'')
         loop = asyncio.get_running_loop()
         self.server.poll_hold = 0.1
+        # The hold is advertised in PONG so the client sizes POLL timeouts to it.
+        pong = unframe(await self.server.dispatch(session, None, PING, 0, 0, 0, b''))
+        self.assertEqual((pong[0], pong[4]), (PONG, struct.pack('!H', 100)))
         started = loop.time()
         self.assertEqual(unframe(await poll())[0], PONG)
         self.assertGreaterEqual(loop.time() - started, 0.09)

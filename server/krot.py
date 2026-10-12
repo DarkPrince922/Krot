@@ -20,7 +20,9 @@ from dnslib import DNSRecord, RR, TXT, A, RD, EDNS0, QTYPE
 OPEN, DATA, CLOSE, POLL, PING, PONG, ACK, ERROR, FIN, OPEN_PART = range(1, 11)
 HEADER = struct.Struct('!BIQQH')
 WINDOW = 64
-POLL_HOLD = 0.3  # seconds a POLL for a not-yet-available block may wait; spec max 0.5
+# Seconds a POLL for a not-yet-available block may wait (spec max 0.5). Off by default:
+# recursive resolvers with adaptive RTO (e.g. Unbound) treat held replies as timeouts.
+POLL_HOLD = 0
 
 
 def hkdf(key, salt, info):
@@ -340,7 +342,8 @@ class KrotServer(asyncio.DatagramProtocol):
 
     async def dispatch(self, session, request, kind, sid, seq, ack, payload):
         if kind == PING and sid == 0 and not payload:
-            return frame(PONG)
+            # Advertise the long-poll hold so the client sizes POLL timeouts to it.
+            return frame(PONG, data=struct.pack('!H', round(self.poll_hold * 1000)))
         if sid == 0:
             return frame(ERROR, sid)
         stream = session.streams.get(sid)

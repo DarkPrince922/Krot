@@ -24,7 +24,9 @@ class NetworkPolicyTest {
         assertEquals(8000L, RpcRetryPolicy.timeoutMs(5000.0, Wire.DATA, 6))
         assertEquals(8000L, RpcRetryPolicy.timeoutMs(20.0, Wire.OPEN, 6))
         assertEquals(750L, RpcRetryPolicy.timeoutMs(Double.NaN, Wire.DATA, 0))
-        // A long-polled POLL gets the server's maximum hold on top.
-        assertEquals(800L, RpcRetryPolicy.timeoutMs(20.0, Wire.POLL, 0))
+        // A POLL gets the hold the server advertised, bounded by the spec maximum.
+        assertEquals(300L, RpcRetryPolicy.timeoutMs(20.0, Wire.POLL, 0))
+        assertEquals(450L, RpcRetryPolicy.timeoutMs(20.0, Wire.POLL, 0, pollHoldMs = 150))
+        assertEquals(800L, RpcRetryPolicy.timeoutMs(20.0, Wire.POLL, 0, pollHoldMs = 9000))
     }
 }

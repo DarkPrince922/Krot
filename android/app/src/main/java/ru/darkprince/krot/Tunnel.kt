@@ -30,6 +30,7 @@ class Tunnel(
     val active = AtomicInteger(0); val inFlight = AtomicInteger(0); val peakInFlight = AtomicInteger(0)
     private val lastTraffic = AtomicLong(System.nanoTime())
     @Volatile var rtt = 500.0
+    @Volatile private var pollHoldMs = 0L // advertised in PONG; older servers send none and never hold
     @Volatile private var lastSuccess = System.nanoTime()
     private val lastStallLog = AtomicLong(0)
     @Volatile private var loggedChunk = 0
@@ -39,6 +40,8 @@ class Tunnel(
         try {
             val hello = rpc(Frame(Wire.PING), helloAttempts)
             require(hello.type == Wire.PONG && hello.stream == 0) { "Неверное приветствие" }
+            learnHold(hello)
+            if (pollHoldMs > 0) log("Long poll сервера: $pollHoldMs мс")
             val server = ServerSocket().also { listener = it }
             server.reuseAddress = true
             server.bind(InetSocketAddress(if (cfg.lan) "0.0.0.0" else "127.0.0.1", cfg.socksPort), 32)
@@ -46,7 +49,7 @@ class Tunnel(
             log("DNS ${resolver.address.hostAddress}:53 · SOCKS ${server.localSocketAddress}")
             heartbeat.scheduleWithFixedDelay({
                 if (!alive.get()) return@scheduleWithFixedDelay
-                try { rpc(Frame(Wire.PING)); status(true) }
+                try { learnHold(rpc(Frame(Wire.PING))); status(true) }
                 catch (_: Exception) { if ((System.nanoTime() - lastSuccess) / 1e9 > 15) status(false) }
             }, 1500, 1500, TimeUnit.MILLISECONDS)
             thread("krot-accept") {
@@ -60,6 +63,10 @@ class Tunnel(
                 }
             }
         } catch (e: Exception) { close(); throw e }
+    }
+
+    private fun learnHold(pong: Frame) {
+        pollHoldMs = if (pong.data.size == 2) ByteBuffer.wrap(pong.data).short.toLong() and 65535 else 0
     }
 
     private class ServerRejected(stream: Int) : IOException("Сервер отклонил поток $stream")
@@ -83,7 +90,7 @@ class Tunnel(
                     try {
                         bindDns(socket); socket.connect(resolver)
                         val start = System.nanoTime()
-                        val timeout = RpcRetryPolicy.timeoutMs(initialRtt, frame.type, attempt)
+                        val timeout = RpcRetryPolicy.timeoutMs(initialRtt, frame.type, attempt, pollHoldMs)
                         val deadline = start + TimeUnit.MILLISECONDS.toNanos(timeout)
                         socket.send(DatagramPacket(packet, packet.size)); queries.incrementAndGet()
                         while (alive.get()) {
@@ -268,7 +275,9 @@ class Tunnel(
                                 require(pending.size <= WINDOW)
                                 while (true) {
                                     val data = pending.remove(downAck.get()) ?: break
-                                    out.write(data); out.flush(); rx.addAndGet(data.size.toLong()); lastTraffic.set(System.nanoTime()); downAck.incrementAndGet()
+                                    // The app closed its socket (Telegram drops connections freely): end quietly.
+                                    try { out.write(data); out.flush() } catch (_: IOException) { finish(); return }
+                                    rx.addAndGet(data.size.toLong()); lastTraffic.set(System.nanoTime()); downAck.incrementAndGet()
                                 }
                                 lastData = System.nanoTime(); lastActive = lastData
                                 monitor.notifyAll() // wake parked lanes

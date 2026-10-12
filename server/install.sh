@@ -4,6 +4,7 @@
 #   sudo bash /opt/krot/server/install.sh tunnel.example.ru
 # Re-running updates the code from the checked-out branch and keeps the password.
 # Env: KROT_BRANCH (default: current branch of /opt/krot), KROT_BIND (default: IPv4 of the default route).
+# Extra server flags: KROT_ARGS=... in /etc/krot.env, e.g. KROT_ARGS=--poll-hold-ms 150
 set -euo pipefail
 
 DOMAIN=${1:?usage: install.sh tunnel.example.ru}
@@ -50,7 +51,7 @@ if [ ! -s /etc/krot.env ]; then
 fi
 chmod 600 /etc/krot.env
 
-sed "s|^ExecStart=.*|ExecStart=$DIR/.venv/bin/python $DIR/server/krot.py --domain $DOMAIN --bind $BIND|" \
+sed "s|^ExecStart=.*|ExecStart=$DIR/.venv/bin/python $DIR/server/krot.py --domain $DOMAIN --bind $BIND \$KROT_ARGS|" \
   "$DIR/server/krot.service" > /etc/systemd/system/krot.service
 systemctl daemon-reload
 systemctl enable -q krot
