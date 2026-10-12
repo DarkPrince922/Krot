@@ -24,7 +24,16 @@ Telegram и другие приложения подключаются свои�
 не меняйте существующий DNS основного домена. Если IP сервера сам в whitelist,
 обычный прямой транспорт может оказаться намного быстрее DNS-туннеля.
 
-Ubuntu 22.04+ / Debian 12+:
+Быстрая установка как systemd-сервис (Debian 12+ / Ubuntu 24.04+, от root): скрипт
+ставит зависимости, генерирует пароль в `/etc/krot.env`, открывает 53/udp в ufw/firewalld
+и проверяет делегирование. Повторный запуск обновляет код и сохраняет пароль.
+
+```bash
+git clone https://github.com/DarkPrince922/Krot.git /opt/krot
+sudo bash /opt/krot/server/install.sh tunnel.example.ru
+```
+
+Вручную, Ubuntu 22.04+ / Debian 12+:
 
 ```bash
 git clone https://github.com/DarkPrince922/Krot.git
