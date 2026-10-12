@@ -151,7 +151,7 @@ class Tunnel(
             val transfer = Transfer(stream, socket, output, chunk); state = transfer
             active.incrementAndGet()
             socksReply(output, 0); socket.soTimeout = 0
-            val lanes = max(1, cfg.pipeline / 2).coerceAtMost(8)
+            val lanes = max(1, cfg.pipeline / active.get().coerceAtLeast(1))
             repeat(lanes) { thread("krot-poll-$stream-$it") { transfer.poll() } }
             var seq = 0L
             val buffer = ByteArray(crypto.maxUp())
