@@ -217,6 +217,9 @@ class KrotServer(asyncio.DatagramProtocol):
         # Queries for our zone dropped for EDNS0: absent or UDP size below 1232.
         self.edns_drops = 0
         self.edns_min = None
+        # Authenticated queries, resolver retransmits (same nonce), answers, oversize drops.
+        self.stats = dict.fromkeys(('queries', 'retransmits', 'answered', 'oversize'), 0)
+        self.resolvers = set()
 
     def connection_made(self, transport):
         self.transport = transport
@@ -245,6 +248,11 @@ class KrotServer(asyncio.DatagramProtocol):
                              self.edns_drops, 'none' if self.edns_min is None else self.edns_min)
                 self.edns_drops = 0
                 self.edns_min = None
+            if self.stats['queries']:
+                logging.info('15s: %d queries, %d resolver retransmits, %d answered, %d oversize; %d resolver IPs',
+                             *self.stats.values(), len(self.resolvers))
+                self.stats = dict.fromkeys(self.stats, 0)
+                self.resolvers = set()
             now = time.monotonic()
             for sid, session in list(self.sessions.items()):
                 if now - session.touched > self.idle_timeout:
@@ -318,12 +326,16 @@ class KrotServer(asyncio.DatagramProtocol):
             if session.qtype != request.q.qtype:
                 return
             session.touched = time.monotonic()
+            self.stats['queries'] += 1
+            self.resolvers.add(addr[0])
             # Exact replay never performs side effects twice. Each retransmission
             # normally uses a fresh nonce; sequence IDs handle those duplicates.
             if nonce in session.seen:
+                self.stats['retransmits'] += 1
                 cached = session.seen[nonce]
                 if cached is not None:
                     self.transport.sendto(self.response(request, cached), addr)
+                    self.stats['answered'] += 1
                 return
             session.seen[nonce] = None
             result = await self.dispatch(session, request, *parsed)
@@ -334,6 +346,9 @@ class KrotServer(asyncio.DatagramProtocol):
             response = self.response(request, packet)
             if len(response) <= 1232:
                 self.transport.sendto(response, addr)
+                self.stats['answered'] += 1
+            else:
+                self.stats['oversize'] += 1
         except asyncio.CancelledError:
             raise
         except Exception:

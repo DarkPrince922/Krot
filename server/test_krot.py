@@ -184,6 +184,15 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.received, before)
         # Only our zone is counted, so the periodic log shows the resolver chain's EDNS.
         self.assertEqual((self.server.edns_drops, self.server.edns_min), (2, 512))
+        # Garbage, foreign and forged queries are not counted as tunnel traffic.
+        stats = self.server.stats
+        self.assertEqual(stats['queries'], stats['answered'])
+        query, _ = client.encode(frame(PING))
+        for _ in range(2): # a resolver retransmitting the same query
+            client.transport.sendto(query.pack(), self.endpoint)
+        await asyncio.sleep(.1)
+        self.assertEqual(stats['retransmits'], 1)
+        self.assertEqual(stats['queries'], stats['answered'])
         self.assertEqual((await client.rpc(frame(PING)))[0], PONG)
 
     async def test_tcp_drain_failure_never_duplicates_write(self):

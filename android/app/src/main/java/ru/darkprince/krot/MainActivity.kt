@@ -15,7 +15,7 @@ class MainActivity : Activity() {
     private lateinit var state: TextView; private lateinit var metrics: TextView; private lateinit var logs: TextView
     private lateinit var toggle: Button; private lateinit var settings: Button
     private var previousTunnel: Tunnel? = null
-    private var lastTime = System.nanoTime(); private var lastTx = 0L; private var lastRx = 0L; private var lastQueries = 0L
+    private var lastTime = System.nanoTime(); private var lastTx = 0L; private var lastRx = 0L; private var lastQueries = 0L; private var lastTimeouts = 0L
     private val tick = object : Runnable { override fun run() { refresh(); handler.postDelayed(this, 1000) } }
     private fun dp(n: Int) = (n * resources.displayMetrics.density).toInt()
     private fun label(text: String, size: Float = 16f): TextView = TextView(this).apply { this.text = text; textSize = size; setTextColor(Color.parseColor("#D9E5DC")); setPadding(0, dp(6), 0, dp(6)) }
@@ -52,11 +52,12 @@ class MainActivity : Activity() {
         state.setTextColor(Color.parseColor(if (Live.connected) "#9BDD7C" else "#D9E5DC"))
         toggle.text = if (Live.running) "Остановить" else "Запустить"; settings.isEnabled = !Live.running
         val tunnel = Live.tunnel
-        if (previousTunnel !== tunnel) { previousTunnel = tunnel; lastTx = 0; lastRx = 0; lastQueries = 0; lastTime = System.nanoTime() }
+        if (previousTunnel !== tunnel) { previousTunnel = tunnel; lastTx = 0; lastRx = 0; lastQueries = 0; lastTimeouts = 0; lastTime = System.nanoTime() }
         val now = System.nanoTime(); val seconds = ((now - lastTime) / 1e9).coerceAtLeast(0.1)
-        val tx = tunnel?.tx?.get() ?: 0; val rx = tunnel?.rx?.get() ?: 0; val q = tunnel?.queries?.get() ?: 0
-        metrics.text = String.format(Locale.ROOT, "RTT %.0f мс  •  QPS %.1f  •  в полёте %d\n↑ %.1f кБ/с  ↓ %.1f кБ/с  •  потоков %d", tunnel?.rtt ?: 0.0, (q - lastQueries) / seconds, tunnel?.inFlight?.get() ?: 0, (tx - lastTx) / seconds / 1024, (rx - lastRx) / seconds / 1024, tunnel?.active?.get() ?: 0)
-        lastTime = now; lastTx = tx; lastRx = rx; lastQueries = q
+        val tx = tunnel?.tx?.get() ?: 0; val rx = tunnel?.rx?.get() ?: 0; val q = tunnel?.queries?.get() ?: 0; val lost = tunnel?.timeouts?.get() ?: 0
+        val loss = if (q > lastQueries) 100.0 * (lost - lastTimeouts) / (q - lastQueries) else 0.0
+        metrics.text = String.format(Locale.ROOT, "RTT %.0f мс  •  QPS %.1f  •  потери %.0f%%  •  в полёте %d\n↑ %.1f кБ/с  ↓ %.1f кБ/с  •  потоков %d", tunnel?.rtt ?: 0.0, (q - lastQueries) / seconds, loss, tunnel?.inFlight?.get() ?: 0, (tx - lastTx) / seconds / 1024, (rx - lastRx) / seconds / 1024, tunnel?.active?.get() ?: 0)
+        lastTime = now; lastTx = tx; lastRx = rx; lastQueries = q; lastTimeouts = lost
         logs.text = Live.logs()
     }
     private fun editSettings() {

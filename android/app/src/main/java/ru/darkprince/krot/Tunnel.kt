@@ -26,7 +26,7 @@ class Tunnel(
     private val nextStream = AtomicInteger(0)
     private val random = SecureRandom()
     private var listener: ServerSocket? = null
-    val queries = AtomicLong(0); val tx = AtomicLong(0); val rx = AtomicLong(0)
+    val queries = AtomicLong(0); val timeouts = AtomicLong(0); val tx = AtomicLong(0); val rx = AtomicLong(0)
     val active = AtomicInteger(0); val inFlight = AtomicInteger(0); val peakInFlight = AtomicInteger(0)
     private val lastTraffic = AtomicLong(System.nanoTime())
     @Volatile var rtt = 500.0
@@ -122,6 +122,7 @@ class Tunnel(
                         lastError = e // retry transient UDP send/receive/bind failures as well
                     } finally { dnsSockets.remove(socket) }
                 }
+                timeouts.incrementAndGet() // this attempt got no valid answer
                 if (attempt == attempts - 1) throw IOException(
                     "DNS ${resolver.address.hostAddress}: нет ответа после $attempts попыток; проверьте делегацию, пароль и резолвер", lastError)
                 Thread.sleep(50L * (attempt + 1))
@@ -215,7 +216,8 @@ class Tunnel(
                 }
             }
         } catch (e: Exception) {
-            if (alive.get()) {
+            // A stream already finished (app closed it, EOF, or its lane logged why) stops retrying silently.
+            if (alive.get() && state?.done?.get() != true) {
                 log("Поток закрыт: ${e.cause?.message ?: e.message}")
                 if (state == null) try { socksReply(socket.getOutputStream(), 1) } catch (_: Exception) { }
             }
