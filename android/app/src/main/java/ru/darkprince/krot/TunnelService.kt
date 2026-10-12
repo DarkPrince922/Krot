@@ -79,13 +79,14 @@ class TunnelService : Service() {
             if (!running.get() || network != connectivity.activeNetwork) return@enqueue
             val config = cfg ?: return@enqueue
             val properties = connectivity.getLinkProperties(network) ?: return@enqueue
-            val addresses = if (config.nameserver.isEmpty()) properties.dnsServers else listOf(InetAddress.getByName(config.nameserver))
+            val automatic = config.nameserver.isEmpty()
+            val addresses = if (automatic) ResolverPolicy.systemCandidates(properties.dnsServers) else listOf(InetAddress.getByName(config.nameserver))
             if (addresses.isEmpty()) { Live.log("В сети нет DNS; задайте IP вручную"); return@enqueue }
             val token = "${network.networkHandle}/${addresses.map { it.hostAddress }}"
             if (token == signature && Live.tunnel != null) return@enqueue
             signature = token
             Live.tunnel?.close(); Live.tunnel = null
-            // Try the system resolvers in order; never inject public DNS defaults.
+            // Prefer the operator's IPv4 resolvers; IPv6 probes are bounded to two attempts.
             for (address in addresses) {
                 if (!running.get()) return@enqueue
                 val candidate = Tunnel(config, InetSocketAddress(address, 53), { network.bindSocket(it) }, Live::log, {
@@ -94,7 +95,8 @@ class TunnelService : Service() {
                 })
                 Live.tunnel = candidate
                 try {
-                    candidate.start()
+                    Live.log("Проверяю DNS ${address.hostAddress}${if (automatic) " · авто" else " · вручную"}")
+                    candidate.start(ResolverPolicy.helloAttempts(automatic, address))
                     if (!running.get()) candidate.close()
                     return@enqueue
                 } catch (e: Exception) { Live.log(e.message ?: "Ошибка соединения"); candidate.close(); Live.tunnel = null }

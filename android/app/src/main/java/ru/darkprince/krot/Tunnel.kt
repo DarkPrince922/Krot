@@ -33,9 +33,9 @@ class Tunnel(
     @Volatile private var lastSuccess = System.nanoTime()
 
     private fun thread(name: String, block: () -> Unit): Thread = Thread(block, name).also { it.isDaemon = true; it.start() }
-    fun start() {
+    fun start(helloAttempts: Int = RpcRetryPolicy.ATTEMPTS) {
         try {
-            val hello = rpc(Frame(Wire.PING))
+            val hello = rpc(Frame(Wire.PING), helloAttempts)
             require(hello.type == Wire.PONG && hello.stream == 0) { "Неверное приветствие" }
             val server = ServerSocket().also { listener = it }
             server.reuseAddress = true
@@ -60,13 +60,18 @@ class Tunnel(
         } catch (e: Exception) { close(); throw e }
     }
 
-    private fun rpc(frame: Frame): Frame {
+    private class ServerRejected(stream: Int) : IOException("Сервер отклонил поток $stream")
+
+    private fun rpc(frame: Frame, attempts: Int = RpcRetryPolicy.ATTEMPTS): Frame {
+        require(attempts in 1..RpcRetryPolicy.ATTEMPTS)
         check(alive.get())
         semaphore.acquire()
         val flight = inFlight.incrementAndGet()
         peakInFlight.updateAndGet { max(it, flight) }
+        val initialRtt = rtt // concurrent successful polls must not reset this RPC's backoff
+        var lastError: IOException? = null
         try {
-            repeat(7) { attempt ->
+            repeat(attempts) { attempt ->
                 check(alive.get())
                 val name = crypto.name(frame) // fresh nonce, including retransmissions
                 val id = random.nextInt(65536)
@@ -76,7 +81,7 @@ class Tunnel(
                     try {
                         bindDns(socket); socket.connect(resolver)
                         val start = System.nanoTime()
-                        val timeout = max(if (frame.type == Wire.OPEN) 2500.0 else 300.0, 1.5 * rtt).coerceAtMost(8000.0).toLong()
+                        val timeout = RpcRetryPolicy.timeoutMs(initialRtt, frame.type, attempt)
                         val deadline = start + TimeUnit.MILLISECONDS.toNanos(timeout)
                         socket.send(DatagramPacket(packet, packet.size)); queries.incrementAndGet()
                         while (alive.get()) {
@@ -88,7 +93,7 @@ class Tunnel(
                                 crypto.open(Dns.answer(reply.data.copyOf(reply.length), id, name, cfg.recordType))
                             } catch (_: Exception) { continue }
                             if (response.stream != frame.stream) continue
-                            if (response.type == Wire.ERROR) throw IOException("Сервер отклонил поток ${frame.stream}")
+                            if (response.type == Wire.ERROR) throw ServerRejected(frame.stream)
                             if (frame.type == Wire.POLL) {
                                 if (response.type !in listOf(Wire.DATA, Wire.PONG, Wire.CLOSE)) continue
                                 if (response.type != Wire.CLOSE && response.seq != frame.seq) continue
@@ -100,9 +105,15 @@ class Tunnel(
                             lastSuccess = System.nanoTime()
                             return response
                         }
+                    } catch (e: ServerRejected) {
+                        throw e // an authenticated rejection is not packet loss
+                    } catch (e: IOException) {
+                        if (!alive.get()) throw e
+                        lastError = e // retry transient UDP send/receive/bind failures as well
                     } finally { dnsSockets.remove(socket) }
                 }
-                if (attempt == 6) throw IOException("DNS timeout: проверьте делегацию, пароль и резолвер")
+                if (attempt == attempts - 1) throw IOException(
+                    "DNS ${resolver.address.hostAddress}: нет ответа после $attempts попыток; проверьте делегацию, пароль и резолвер", lastError)
                 Thread.sleep(50L * (attempt + 1))
             }
             error("unreachable")
