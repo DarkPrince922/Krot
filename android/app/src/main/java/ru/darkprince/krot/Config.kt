@@ -21,7 +21,7 @@ data class Config(val domain: String, val password: String, val nameserver: Stri
                 else ipv4.size == 4 && ipv4.all { part -> part.isNotEmpty() && part.all(Char::isDigit) && (part.toIntOrNull() ?: -1) in 0..255 }
             require(numeric) { "Nameserver должен быть корректным IP, не именем" }
         }
-        require(recordType in listOf(1, 10, 16) && pipeline in 8..16 && maxResponse in 100..1100 && socksPort in 1024..65535) { "Проверьте числовые настройки" }
+        require(recordType in listOf(1, 10, 16) && pipeline in 8..32 && maxResponse in 100..1100 && socksPort in 1024..65535) { "Проверьте числовые настройки" }
     }
     fun save(context: Context) {
         validate()

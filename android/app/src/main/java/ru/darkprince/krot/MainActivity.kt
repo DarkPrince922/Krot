@@ -77,7 +77,7 @@ class MainActivity : Activity() {
         box.addView(label("Тип DNS-записи", 13f))
         val types = listOf(16, 10, 1)
         val type = Spinner(this).apply { adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, listOf("TXT · рекомендуется", "NULL · экспериментально", "A · медленно")); setSelection(types.indexOf(cfg.recordType).coerceAtLeast(0)) }; box.addView(type)
-        val pipeline = edit("Конвейер · 8–16", cfg.pipeline.toString(), true)
+        val pipeline = edit("Конвейер · 8–32", cfg.pipeline.toString(), true)
         val size = edit("Максимум ответа · 100–1100 байт (адаптивно)", cfg.maxResponse.toString(), true)
         val port = edit("Порт SOCKS · 1024–65535", cfg.socksPort.toString(), true)
         val lan = CheckBox(this).apply { text = "Принимать SOCKS-соединения из LAN"; isChecked = cfg.lan }; box.addView(lan)

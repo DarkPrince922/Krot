@@ -103,7 +103,8 @@ class Tunnel(
                                 if (response.type != Wire.PONG) continue
                             } else if (response.type != Wire.ACK || response.seq != frame.seq) continue
                             val sample = (System.nanoTime() - start) / 1e6
-                            synchronized(this) { rtt = rtt * 0.8 + sample * 0.2 }
+                            // A POLL may be held by the server (long poll): it is not a network RTT sample.
+                            if (frame.type != Wire.POLL) synchronized(this) { rtt = rtt * 0.8 + sample * 0.2 }
                             lastSuccess = System.nanoTime()
                             return response
                         }
@@ -183,8 +184,8 @@ class Tunnel(
             val transfer = Transfer(stream, socket, output, chunk); state = transfer
             active.incrementAndGet()
             socksReply(output, 0); socket.soTimeout = 0
-            val lanes = max(1, cfg.pipeline / active.get().coerceAtLeast(1))
-            repeat(lanes) { thread("krot-poll-$stream-$it") { transfer.poll() } }
+            // Every stream may use the whole pipeline; the global semaphore shares it and idle lanes park.
+            repeat(cfg.pipeline) { lane -> thread("krot-poll-$stream-$lane") { transfer.poll(lane) } }
             var seq = 0L
             val buffer = ByteArray(crypto.maxUp())
             while (alive.get() && !transfer.done.get()) {
@@ -192,6 +193,7 @@ class Tunnel(
                 if (n == 0) continue
                 val part = buffer.copyOf(n); val index = seq++
                 jobs.add(uploads.submit {
+                    transfer.lastActive = System.nanoTime() // a reply is likely to follow
                     streamRpc(Frame(Wire.DATA, transfer.stream, index, transfer.downAck.get(), part), transfer)
                     tx.addAndGet(part.size.toLong()); lastTraffic.set(System.nanoTime())
                 })
@@ -227,37 +229,56 @@ class Tunnel(
 
     private inner class Transfer(val stream: Int, val socket: Socket, val out: java.io.OutputStream, val chunk: Int) {
         val monitor = Object(); val done = AtomicBoolean(false)
-        val downAck = AtomicLong(0); private val nextPoll = AtomicLong(0)
-        private val pending = sortedMapOf<Long, ByteArray>(); private var eof: Long? = null
+        val downAck = AtomicLong(0)
+        private val pending = sortedMapOf<Long, ByteArray>(); private val polling = HashSet<Long>(); private var eof: Long? = null
+        @Volatile private var lastData = 0L // no downstream yet: only lane 0 polls
+        @Volatile var lastActive = System.nanoTime()
         fun finish() {
             if (done.compareAndSet(false, true)) {
                 try { socket.close() } catch (_: Exception) { }
                 synchronized(monitor) { monitor.notifyAll() }
             }
         }
-        fun poll() {
-            var requested = nextPoll.getAndIncrement()
+        /** Lowest block neither received nor being polled, inside the window. Caller holds [monitor]. */
+        private fun claim(): Long? {
+            var seq = downAck.get()
+            while (seq in pending || seq in polling) seq++
+            if (seq >= downAck.get() + WINDOW || eof?.let { seq >= it } == true) return null
+            polling.add(seq); return seq
+        }
+        fun poll(lane: Int) {
             try {
                 while (alive.get() && !done.get()) {
-                    val response = streamRpc(Frame(Wire.POLL, stream, requested, downAck.get()), this)
+                    val requested = synchronized(monitor) {
+                        // Extra lanes run only while downstream data flows; lane 0 keeps watch via long poll.
+                        val parked = lane > 0 && System.nanoTime() - lastData > LANE_IDLE_NS
+                        val seq = if (parked) null else claim()
+                        if (seq == null && !done.get()) monitor.wait(if (parked) 1000 else 50)
+                        seq
+                    } ?: continue
+                    val response = try { streamRpc(Frame(Wire.POLL, stream, requested, downAck.get()), this) }
+                        catch (e: Exception) { synchronized(monitor) { polling.remove(requested) }; throw e }
                     synchronized(monitor) {
+                        polling.remove(requested)
                         if (done.get()) return
                         when (response.type) {
                             Wire.DATA -> {
                                 require(response.seq == requested && response.data.isNotEmpty() && response.data.size <= chunk)
                                 if (response.seq >= downAck.get()) pending[response.seq] = response.data
-                                require(pending.size <= 64)
+                                require(pending.size <= WINDOW)
                                 while (true) {
                                     val data = pending.remove(downAck.get()) ?: break
                                     out.write(data); out.flush(); rx.addAndGet(data.size.toLong()); lastTraffic.set(System.nanoTime()); downAck.incrementAndGet()
                                 }
-                                requested = nextPoll.getAndIncrement()
+                                lastData = System.nanoTime(); lastActive = lastData
+                                monitor.notifyAll() // wake parked lanes
                             }
                             Wire.CLOSE -> { require(response.seq >= downAck.get()); eof = response.seq }
                         }
                         if (eof == downAck.get()) { finish(); return }
                     }
-                    if (response.type != Wire.DATA) Thread.sleep(if (System.nanoTime() - lastTraffic.get() > TimeUnit.SECONDS.toNanos(3)) 1500 else 90)
+                    // The server already held an empty POLL; back off only on a stream idle for 3s.
+                    if (response.type != Wire.DATA) Thread.sleep(if (System.nanoTime() - lastActive > TimeUnit.SECONDS.toNanos(3)) 1500 else 90)
                 }
             } catch (e: Exception) {
                 if (!done.get() && alive.get()) log("Поток $stream: ${e.message}")
@@ -266,7 +287,11 @@ class Tunnel(
         }
     }
 
-    companion object { const val STREAM_STALL_MS = 60_000L }
+    companion object {
+        const val STREAM_STALL_MS = 60_000L
+        private const val WINDOW = 64 // blocks, as on the server
+        private val LANE_IDLE_NS = TimeUnit.SECONDS.toNanos(1)
+    }
 
     override fun close() {
         if (!alive.compareAndSet(true, false)) return

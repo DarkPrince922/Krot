@@ -20,6 +20,7 @@ from dnslib import DNSRecord, RR, TXT, A, RD, EDNS0, QTYPE
 OPEN, DATA, CLOSE, POLL, PING, PONG, ACK, ERROR, FIN, OPEN_PART = range(1, 11)
 HEADER = struct.Struct('!BIQQH')
 WINDOW = 64
+POLL_HOLD = 0.3  # seconds a POLL for a not-yet-available block may wait; spec max 0.5
 
 
 def hkdf(key, salt, info):
@@ -75,6 +76,8 @@ class Stream:
     read_task: asyncio.Task | None = None
     incoming: dict = field(default_factory=dict)
     outgoing: dict = field(default_factory=dict)
+    # Downstream bytes not yet cut into blocks: blocks are cut on POLL so they are full.
+    buffer: bytearray = field(default_factory=bytearray)
     up_next: int = 0
     down_next: int = 0
     down_ack: int = 0
@@ -84,6 +87,7 @@ class Stream:
     fin: int | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     changed: asyncio.Event = field(default_factory=asyncio.Event)
+    readable: asyncio.Event = field(default_factory=asyncio.Event)
 
     async def connect(self, allow_private):
         try:
@@ -111,26 +115,58 @@ class Stream:
     async def read_remote(self):
         try:
             while not self.closed:
-                while len(self.outgoing) >= WINDOW and not self.closed:
+                # Unacked blocks plus buffered bytes stay within WINDOW blocks.
+                while self.room() <= 0 and not self.closed:
                     self.changed.clear()
                     await self.changed.wait()
                 if self.closed:
                     break
-                data = await self.reader.read(self.chunk)
+                data = await self.reader.read(self.room())
                 if not data:
                     break
-                self.outgoing[self.down_next] = data
-                self.down_next += 1
+                self.buffer.extend(data)
+                self.readable.set()
         except (OSError, asyncio.CancelledError):
             pass
         finally:
             self.eof = True
+            self.readable.set()
+
+    def acknowledge(self, ack):
+        """Apply a cumulative downstream ACK; False if it covers uncreated blocks."""
+        if ack > self.down_next:
+            return False
+        if ack > self.down_ack:
+            for key in list(self.outgoing):
+                if key < ack:
+                    del self.outgoing[key]
+            self.down_ack = ack
+            self.changed.set()
+        return True
+
+    def room(self):
+        return (WINDOW - len(self.outgoing)) * self.chunk - len(self.buffer)
+
+    def block(self, seq):
+        """Return block seq, cutting full blocks from the buffer up to it.
+
+        A partial block is cut only when exactly the next block is requested, so
+        lanes polling ahead never fragment a burst that is still arriving.
+        """
+        while self.down_next <= seq and (len(self.buffer) >= self.chunk
+                                         or (self.down_next == seq and self.buffer)):
+            self.outgoing[self.down_next] = bytes(self.buffer[:self.chunk])
+            del self.buffer[:self.chunk]
+            self.down_next += 1
+        return self.outgoing.get(seq)
 
     def shutdown(self):
         self.closed = True
         self.incoming.clear()
         self.outgoing.clear()
+        self.buffer.clear()
         self.changed.set()
+        self.readable.set()
         if self.read_task:
             self.read_task.cancel()
         if self.opening and not self.opening.done():
@@ -163,7 +199,7 @@ class Session:
 
 class KrotServer(asyncio.DatagramProtocol):
     def __init__(self, domain, password, max_response=900, allow_private=False,
-                 max_sessions=128, max_streams=64, idle_timeout=120):
+                 max_sessions=128, max_streams=64, idle_timeout=120, poll_hold=POLL_HOLD):
         self.domain = domain.lower().strip('.')
         self.master = master_key(password, self.domain)
         self.max_response = max_response
@@ -171,6 +207,7 @@ class KrotServer(asyncio.DatagramProtocol):
         self.max_sessions = max_sessions
         self.max_streams = max_streams
         self.idle_timeout = idle_timeout
+        self.poll_hold = poll_hold
         self.sessions = {}
         self.tasks = set()
         self.transport = None
@@ -351,15 +388,11 @@ class KrotServer(asyncio.DatagramProtocol):
             return frame(ERROR if stream.error else ACK, sid, data=struct.pack('!H', stream.chunk))
         if stream is None:
             return frame(ERROR, sid)
+        if kind == POLL and not payload:
+            return await self.poll(stream, sid, seq, ack)
         async with stream.lock:
-            if ack > stream.down_next:
+            if not stream.acknowledge(ack):
                 return frame(ERROR, sid)
-            if ack > stream.down_ack:
-                for key in list(stream.outgoing):
-                    if key < ack:
-                        del stream.outgoing[key]
-                stream.down_ack = ack
-                stream.changed.set()
             if kind == CLOSE:
                 stream.shutdown()
                 return frame(ACK, sid, seq)
@@ -394,16 +427,33 @@ class KrotServer(asyncio.DatagramProtocol):
                 if seq == stream.up_next and stream.writer.can_write_eof():
                     stream.writer.write_eof()
                 return frame(ACK, sid, seq)
-            if kind == POLL and not payload:
+            return frame(ERROR, sid)
+
+    async def poll(self, stream, sid, seq, ack):
+        # Long poll: hold an empty POLL briefly so new data leaves immediately
+        # instead of after the client's next round trip.
+        deadline = asyncio.get_running_loop().time() + self.poll_hold
+        while True:
+            async with stream.lock:
+                if not stream.acknowledge(ack):
+                    return frame(ERROR, sid)
+                if stream.closed or stream.error:
+                    return frame(ERROR, sid)
                 if seq < stream.down_ack or seq >= stream.down_ack + WINDOW:
                     return frame(PONG, sid, seq)
-                data = stream.outgoing.get(seq)
+                data = stream.block(seq)
                 if data is not None:
                     return frame(DATA, sid, seq, data=data)
-                if stream.eof:
+                if stream.eof and not stream.buffer:
                     return frame(CLOSE, sid, stream.down_next)
+                stream.readable.clear()
+            left = deadline - asyncio.get_running_loop().time()
+            if left <= 0:
                 return frame(PONG, sid, seq)
-            return frame(ERROR, sid)
+            try:
+                await asyncio.wait_for(stream.readable.wait(), left)
+            except asyncio.TimeoutError:
+                return frame(PONG, sid, seq)
 
 
 async def main(args):
@@ -412,6 +462,8 @@ async def main(args):
         raise SystemExit('Set KROT_PASSWORD to a random secret of at least 16 characters')
     if not 100 <= args.max_response <= 1100:
         raise SystemExit('--max-response must be 100..1100')
+    if not 0 <= args.poll_hold_ms <= 500:
+        raise SystemExit('--poll-hold-ms must be 0..500')
     domain = args.domain.lower().strip('.')
     if not domain.startswith('tunnel.') or any(not label or len(label) > 63 for label in domain.split('.')):
         raise SystemExit('--domain must be a valid delegated tunnel.example.ru zone')
@@ -419,7 +471,7 @@ async def main(args):
         raise SystemExit('Use a shorter domain (at most 90 characters)')
     loop = asyncio.get_running_loop()
     transport, _ = await loop.create_datagram_endpoint(
-        lambda: KrotServer(domain, password, args.max_response, args.allow_private),
+        lambda: KrotServer(domain, password, args.max_response, args.allow_private, poll_hold=args.poll_hold_ms / 1000),
         local_addr=(args.bind, args.port))
     logging.info('Krot listening on %s:%d, zone %s, max response %d', args.bind, args.port, domain, args.max_response)
     try:
@@ -434,6 +486,8 @@ if __name__ == '__main__':
     parser.add_argument('--bind', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=53)
     parser.add_argument('--max-response', type=int, default=900)
+    parser.add_argument('--poll-hold-ms', type=int, default=int(POLL_HOLD * 1000),
+                        help='Long-poll wait for downstream data, 0..500 ms')
     parser.add_argument('--allow-private', action='store_true', help='Permit LAN/loopback destinations')
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
     asyncio.run(main(parser.parse_args()))

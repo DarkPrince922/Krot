@@ -80,7 +80,7 @@ class Client(asyncio.DatagramProtocol):
             self.max_flight = max(self.max_flight, len(self.pending))
             self.transport.sendto(query.pack(), self.endpoint)
             try:
-                return await asyncio.wait_for(future, 0.2)
+                return await asyncio.wait_for(future, 0.2 + (POLL_HOLD if plain[0] == POLL else 0))
             except asyncio.TimeoutError:
                 pass
             finally:
@@ -201,6 +201,48 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(unframe(result)[0], ERROR)
         self.assertEqual(writer.writes, [b'once'])
         self.assertTrue(stream.closed)
+
+    def stream(self, chunk=600):
+        session = Session(b'x' * 32, b'y' * 32, QTYPE.TXT)
+        stream = Stream('127.0.0.1', 80, chunk)
+        session.streams[1] = stream
+        return session, stream
+
+    async def test_blocks_are_full_and_cut_on_demand(self):
+        self.server.poll_hold = 0.05
+        session, stream = self.stream()
+        stream.buffer.extend(os.urandom(1900))
+        poll = lambda seq: self.server.dispatch(session, None, POLL, 1, seq, 0, b'')
+        # Lanes ahead of the head get full blocks; small TCP reads never leak through.
+        reply = unframe(await poll(2))
+        self.assertEqual((reply[0], reply[2], len(reply[4])), (DATA, 2, 600))
+        self.assertEqual([len(stream.outgoing[i]) for i in range(3)], [600, 600, 600])
+        # A lane ahead of the head does not cut the 100-byte tail...
+        self.assertEqual(unframe(await poll(4))[0], PONG)
+        self.assertEqual(stream.down_next, 3)
+        # ...the head lane does, so trickling data is still delivered at once.
+        self.assertEqual(len(unframe(await poll(3))[4]), 100)
+
+    async def test_long_poll_returns_data_as_it_arrives(self):
+        session, stream = self.stream()
+        poll = lambda: self.server.dispatch(session, None, POLL, 1, 0, 0, b'')
+        loop = asyncio.get_running_loop()
+        self.server.poll_hold = 0.1
+        started = loop.time()
+        self.assertEqual(unframe(await poll())[0], PONG)
+        self.assertGreaterEqual(loop.time() - started, 0.09)
+        self.server.poll_hold = 2
+        def arrive():
+            stream.buffer.extend(b'late')
+            stream.readable.set()
+        loop.call_later(0.05, arrive)
+        started = loop.time()
+        reply = unframe(await poll())
+        self.assertEqual((reply[0], reply[4]), (DATA, b'late'))
+        self.assertLess(loop.time() - started, 1)
+        stream.eof = True
+        stream.readable.set()
+        self.assertEqual(unframe(await self.server.dispatch(session, None, POLL, 1, 1, 1, b''))[:3], (CLOSE, 1, 1))
 
     async def test_fragmented_open_idempotent(self):
         client = await self.client()

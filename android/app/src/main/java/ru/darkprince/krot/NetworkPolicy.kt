@@ -19,10 +19,12 @@ object ResolverPolicy {
 object RpcRetryPolicy {
     const val ATTEMPTS = 7
     const val MAX_TIMEOUT_MS = 8000L
+    /** Upper bound of the server's long-poll hold for an empty POLL. */
+    const val POLL_HOLD_MS = 500L
     fun timeoutMs(rttMs: Double, type: Int, attempt: Int): Long {
         require(attempt in 0 until ATTEMPTS)
         val sample = if (rttMs.isFinite() && rttMs >= 0) rttMs else 500.0
-        val first = max(if (type == Wire.OPEN) 2500.0 else 300.0, 1.5 * sample)
+        val first = max(if (type == Wire.OPEN) 2500.0 else 300.0, 1.5 * sample) + if (type == Wire.POLL) POLL_HOLD_MS else 0
         return (first * 1.5.pow(attempt)).coerceAtMost(MAX_TIMEOUT_MS.toDouble()).toLong()
     }
 }
